@@ -1,0 +1,300 @@
+---
+- name: Install LDevID provisioning tools
+  ansible.builtin.apt:
+    name:
+      - tpm2-tools
+      - tpm2-openssl
+    state: present
+    update_cache: true
+
+- name: Create LDevID directory
+  ansible.builtin.file:
+    path: "{{ spire_devid_dir }}"
+    state: directory
+    owner: root
+    group: "{{ spire_agent_group }}"
+    mode: "0750"
+
+- name: Inspect existing LDevID artifacts
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ spire_devid_dir }}/devid.crt.pem"
+    - "{{ spire_devid_dir }}/devid.priv.blob"
+    - "{{ spire_devid_dir }}/devid.pub.blob"
+  register: devid_artifacts
+
+- name: Decide whether LDevID provisioning is required
+  ansible.builtin.set_fact:
+    devid_provision_required: >-
+      {{
+        spire_reprovision_devid | bool
+        or
+        (devid_artifacts.results | selectattr('stat.exists', 'equalto', false) | list | length > 0)
+      }}
+
+- name: Check step-ca service when LDevID provisioning is required
+  ansible.builtin.command:
+    argv:
+      - docker
+      - compose
+      - exec
+      - -T
+      - "{{ step_ca_service }}"
+      - step
+      - ca
+      - provisioner
+      - list
+    chdir: "{{ local_project_root }}"
+  changed_when: false
+  when: devid_provision_required
+  delegate_to: localhost
+  become: false
+
+- name: Create controller enrollment directory
+  ansible.builtin.file:
+    path: "{{ local_enrollment_dir }}"
+    state: directory
+    mode: "0700"
+  when: devid_provision_required
+  delegate_to: localhost
+  become: false
+
+- name: Remove previous enrollment outputs
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "{{ local_enrollment_dir }}/devid.csr"
+    - "{{ local_enrollment_dir }}/devid.crt"
+    - "{{ local_enrollment_dir }}/devid.crt.pem"
+  when: devid_provision_required
+  delegate_to: localhost
+  become: false
+
+- name: Remove old remote LDevID staging directory
+  ansible.builtin.file:
+    path: "{{ spire_devid_dir }}/.staging"
+    state: absent
+  when: devid_provision_required
+
+- name: Create remote LDevID staging directory
+  ansible.builtin.file:
+    path: "{{ spire_devid_dir }}/.staging"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+  when: devid_provision_required
+
+- name: Generate TPM-resident LDevID key and CSR
+  ansible.builtin.shell: |
+    set -euo pipefail
+    umask 077
+
+    work="$(mktemp -d /var/tmp/spire-devid.XXXXXX)"
+    handle=""
+
+    cleanup() {
+        if [ -n "${handle}" ]; then
+            tpm2_evictcontrol -C o -c "${handle}" >/dev/null 2>&1 || true
+        fi
+        rm -rf "${work}"
+    }
+    trap cleanup EXIT
+
+    tpm2_createprimary \
+        -C o \
+        -g sha256 \
+        -G ecc256:aes128cfb \
+        -a "fixedtpm|fixedparent|sensitivedataorigin|userwithauth|restricted|decrypt|noda" \
+        -c "${work}/primary.ctx"
+
+    tpm2_create \
+        -C "${work}/primary.ctx" \
+        -G ecc:ecdsa-sha256 \
+        -u "${work}/devid.pub.tpm2b" \
+        -r "${work}/devid.priv.tpm2b" \
+        -a "fixedtpm|fixedparent|sensitivedataorigin|userwithauth|sign|noda"
+
+    # SPIRE expects TPMT_PUBLIC / TPMT_PRIVATE, i.e. the TPM2B two-byte
+    # size prefix produced by tpm2_create must be stripped.
+    tail -c +3 "${work}/devid.pub.tpm2b" > "{{ spire_devid_dir }}/.staging/devid.pub.blob"
+    tail -c +3 "${work}/devid.priv.tpm2b" > "{{ spire_devid_dir }}/.staging/devid.priv.blob"
+
+    tpm2_load \
+        -C "${work}/primary.ctx" \
+        -u "${work}/devid.pub.tpm2b" \
+        -r "${work}/devid.priv.tpm2b" \
+        -c "${work}/devid.ctx"
+
+    handle=""
+
+    for n in $(seq 0 255); do
+        candidate="$(printf '0x%08x' "$((0x81010000 + n))")"
+
+        if ! tpm2_getcap handles-persistent \
+            | grep -Fqi -- "${candidate}"; then
+            handle="${candidate}"
+            break
+        fi
+    done
+
+    if [ -z "${handle}" ]; then
+        echo "No free TPM persistent handle found in 0x81010000-0x810100ff" >&2
+        exit 1
+    fi
+
+    tpm2_evictcontrol \
+        -C o \
+        -c "${work}/devid.ctx" \
+      "${handle}"
+
+    openssl req \
+        -provider tpm2 \
+        -provider default \
+        -propquery '?provider=tpm2' \
+        -new \
+        -key "handle:${handle}" \
+        -subj {{ spire_devid_subject | quote }} \
+        -addext {{ ('subjectAltName=' ~ spire_devid_san) | quote }} \
+        -out "{{ spire_devid_dir }}/.staging/devid.csr"
+
+    openssl req \
+        -in "{{ spire_devid_dir }}/.staging/devid.csr" \
+        -noout \
+        -verify
+  args:
+    executable: /bin/bash
+  when: devid_provision_required
+  changed_when: true
+
+- name: Fetch TPM-backed LDevID CSR to controller
+  ansible.builtin.fetch:
+    src: "{{ spire_devid_dir }}/.staging/devid.csr"
+    dest: "{{ local_enrollment_dir }}/devid.csr"
+    flat: true
+  when: devid_provision_required
+
+- name: Generate CSR-bound Smallstep enrollment token
+  ansible.builtin.command:
+    argv:
+      - docker
+      - compose
+      - exec
+      - -T
+      - "{{ step_ca_service }}"
+      - step
+      - ca
+      - token
+      - "{{ spire_devid_name }}"
+      - --issuer
+      - "{{ step_ca_provisioner }}"
+      - --cnf-file
+      - "/home/step/enrollment/{{ inventory_hostname }}/devid.csr"
+      - --provisioner-password-file
+      - "{{ step_ca_provisioner_password_file }}"
+    chdir: "{{ local_project_root }}"
+  register: step_enrollment_token
+  when: devid_provision_required
+  delegate_to: localhost
+  become: false
+  no_log: true
+  changed_when: true
+
+- name: Sign LDevID CSR using step-ca
+  ansible.builtin.command:
+    argv:
+      - docker
+      - compose
+      - exec
+      - -T
+      - "{{ step_ca_service }}"
+      - step
+      - ca
+      - sign
+      - "/home/step/enrollment/{{ inventory_hostname }}/devid.csr"
+      - "/home/step/enrollment/{{ inventory_hostname }}/devid.crt"
+      - "--token={{ step_enrollment_token.stdout | trim }}"
+    chdir: "{{ local_project_root }}"
+  when: devid_provision_required
+  delegate_to: localhost
+  become: false
+  no_log: true
+  changed_when: true
+
+- name: Verify newly issued LDevID certificate chain
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - verify
+      - -CAfile
+      - "{{ local_device_ca_root }}"
+      - -untrusted
+      - "{{ local_device_ca_intermediate }}"
+      - "{{ local_enrollment_dir }}/devid.crt"
+  when: devid_provision_required
+  delegate_to: localhost
+  become: false
+  changed_when: false
+
+- name: Build LDevID leaf plus intermediate bundle
+  ansible.builtin.shell: |
+    set -euo pipefail
+    cat \
+      {{ (local_enrollment_dir ~ '/devid.crt') | quote }} \
+      {{ local_device_ca_intermediate | quote }} \
+      > {{ (local_enrollment_dir ~ '/devid.crt.pem') | quote }}
+  args:
+    executable: /bin/bash
+  when: devid_provision_required
+  delegate_to: localhost
+  become: false
+  changed_when: true
+
+- name: Stage LDevID certificate bundle on Pi
+  ansible.builtin.copy:
+    src: "{{ local_enrollment_dir }}/devid.crt.pem"
+    dest: "{{ spire_devid_dir }}/.staging/devid.crt.pem"
+    owner: root
+    group: root
+    mode: "0600"
+  when: devid_provision_required
+
+- name: Install LDevID artifacts
+  ansible.builtin.copy:
+    src: "{{ spire_devid_dir }}/.staging/{{ item }}"
+    dest: "{{ spire_devid_dir }}/{{ item }}"
+    remote_src: true
+    owner: root
+    group: "{{ spire_agent_group }}"
+    mode: "0640"
+  loop:
+    - devid.crt.pem
+    - devid.priv.blob
+    - devid.pub.blob
+  when: devid_provision_required
+  notify: Restart SPIRE agent
+
+- name: Remove remote LDevID staging directory
+  ansible.builtin.file:
+    path: "{{ spire_devid_dir }}/.staging"
+    state: absent
+  when: devid_provision_required
+
+- name: Report LDevID certificate fingerprint
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - x509
+      - -in
+      - "{{ spire_devid_dir }}/devid.crt.pem"
+      - -noout
+      - -fingerprint
+      - -sha1
+  register: devid_fingerprint
+  changed_when: false
+
+- name: Display expected tpm_devid identity suffix
+  ansible.builtin.debug:
+    msg: "{{ devid_fingerprint.stdout }}"

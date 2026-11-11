@@ -1,0 +1,3 @@
+---
+- import_playbook: enable-tpm.yml
+- import_playbook: deploy-agent.yml

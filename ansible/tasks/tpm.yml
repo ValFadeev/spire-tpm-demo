@@ -1,0 +1,57 @@
+---
+- name: Install external TPM node attestor plugin
+  ansible.builtin.copy:
+    src: "{{ local_bin_dir }}/tpm_attestor_agent"
+    dest: "{{ spire_tpm_plugin }}"
+    owner: root
+    group: root
+    mode: "0755"
+  notify: Restart SPIRE agent
+
+- name: Install TPM public-hash utility
+  ansible.builtin.copy:
+    src: "{{ local_bin_dir }}/get_tpm_pubhash"
+    dest: "{{ spire_tpm_pubhash_tool }}"
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Obtain TPM EK public-key hash
+  ansible.builtin.command:
+    cmd: "{{ spire_tpm_pubhash_tool }}"
+  register: tpm_pubhash
+  changed_when: false
+
+- name: Store TPM EK hash as fact
+  ansible.builtin.set_fact:
+    tpm_ek_hash: "{{ tpm_pubhash.stdout | trim | lower }}"
+
+- name: Validate TPM EK hash format
+  ansible.builtin.assert:
+    that:
+      - tpm_ek_hash is match('^[0-9a-f]{64}$')
+    fail_msg: >
+      get_tpm_pubhash returned an unexpected value:
+      {{ tpm_pubhash.stdout }}
+
+- name: Ensure local TPM hash authorization directory exists
+  ansible.builtin.file:
+    path: "{{ local_tpm_hash_dir }}"
+    state: directory
+    mode: "0755"
+  delegate_to: localhost
+  become: false
+
+- name: Authorize TPM EK hash for external TPM server plugin
+  ansible.builtin.file:
+    path: "{{ local_tpm_hash_dir }}/{{ tpm_ek_hash }}"
+    state: touch
+    modification_time: preserve
+    access_time: preserve
+    mode: "0644"
+  delegate_to: localhost
+  become: false
+
+- name: Report external TPM identity
+  ansible.builtin.debug:
+    msg: "Authorized TPM EK public-key hash {{ tpm_ek_hash }}"

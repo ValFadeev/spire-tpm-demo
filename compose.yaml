@@ -1,0 +1,47 @@
+services:
+  spire-server-tpm:
+    build:
+      dockerfile: Dockerfile.tpm
+      context: .
+    container_name: spire-server
+
+    ports:
+      - "8081:8081"
+
+    volumes:
+      - ./conf/server_tpm.conf:/opt/spire/conf/server/server.conf:ro
+      - ./tpm-hashes:/opt/spire/tpm-hashes:ro
+      - spire-server-data:/opt/spire/data/server
+    restart: unless-stopped
+
+  spire-server-tpm-devid:
+    build:
+      dockerfile: Dockerfile.tpm_devid
+      context: .
+    container_name: spire-server
+
+    ports:
+      - "8081:8081"
+
+    volumes:
+      - ./conf/server_tpm_devid.conf:/opt/spire/conf/server/server.conf:ro
+      - spire-server-data:/opt/spire/data/server
+      - ./device-ca/certs/root_ca.crt:/opt/spire/conf/server/device-ca.pem:ro
+      - ./conf/tpm/endorsement-ca.pem:/opt/spire/conf/server/endorsement-ca.pem:ro
+    restart: unless-stopped
+
+
+  step-ca:
+    image: smallstep/step-ca
+    container_name: step-ca
+
+    ports:
+      - "9000:9000"
+
+    volumes:
+      - ./device-ca:/home/step
+
+    restart: unless-stopped
+
+volumes:
+  spire-server-data:

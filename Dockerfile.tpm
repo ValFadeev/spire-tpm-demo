@@ -1,0 +1,23 @@
+FROM ubuntu:24.04
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p \
+    /opt/spire/bin \
+    /opt/spire/conf/server \
+    /opt/spire/data/server \
+    /opt/spire/tpm-hashes
+
+COPY bin/spire-server /opt/spire/bin/spire-server
+COPY bin/tpm_attestor_server /opt/spire/bin/tpm_attestor_server
+
+RUN chmod 0755 \
+    /opt/spire/bin/spire-server \
+    /opt/spire/bin/tpm_attestor_server
+
+EXPOSE 8081
+
+ENTRYPOINT ["/opt/spire/bin/spire-server"]
+CMD ["run", "-config", "/opt/spire/conf/server/server.conf"]

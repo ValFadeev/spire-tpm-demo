@@ -1,0 +1,45 @@
+agent {
+    data_dir = "{{ spire_data_dir }}"
+    log_level = "INFO"
+
+    trust_domain = "{{ spire_trust_domain }}"
+
+    server_address = "{{ spire_server_address }}"
+    server_port = "{{ spire_server_port }}"
+
+    trust_bundle_path = "{{ spire_config_dir }}/bootstrap.crt"
+
+    socket_path = "{{ spire_agent_socket }}"
+}
+
+plugins {
+    KeyManager "disk" {
+        plugin_data {
+            directory = "{{ spire_data_dir }}"
+        }
+    }
+
+{% if spire_attestor == "tpm" %}
+    NodeAttestor "tpm" {
+        plugin_cmd = "{{ spire_tpm_plugin }}"
+
+        plugin_data {
+        }
+    }
+{% elif spire_attestor == "tpm_devid" %}
+    NodeAttestor "tpm_devid" {
+        plugin_data {
+            tpm_device_path = "/dev/tpmrm0"
+
+            devid_cert_path = "{{ spire_devid_dir }}/devid.crt.pem"
+            devid_priv_path = "{{ spire_devid_dir }}/devid.priv.blob"
+            devid_pub_path  = "{{ spire_devid_dir }}/devid.pub.blob"
+        }
+    }
+{% endif %}
+
+    WorkloadAttestor "unix" {
+        plugin_data {
+        }
+    }
+}

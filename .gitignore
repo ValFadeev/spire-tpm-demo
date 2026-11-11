@@ -1,0 +1,7 @@
+bin/
+tpm-hashes/
+*.key
+*.der
+*.pem
+*.crt
+device-ca/

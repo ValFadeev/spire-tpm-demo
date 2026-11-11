@@ -1,0 +1,237 @@
+---
+- name: Configure SPIRE agent on Raspberry Pi
+  hosts: spire_agents
+  become: true
+
+  vars:
+    # Select "tpm" for the external SPIFFE TPM plugin, or "tpm_devid"
+    # for SPIRE's built-in TPM DevID attestor.
+    spire_attestor: "tpm"
+
+    spire_trust_domain: "example.org"
+    spire_server_port: 8081
+
+    spire_agent_user: "spire-agent"
+    spire_agent_group: "spire-agent"
+
+    spire_base_dir: "/opt/spire-agent"
+    spire_bin_dir: "{{ spire_base_dir }}/bin"
+    spire_plugin_dir: "{{ spire_base_dir }}/plugins"
+    spire_config_dir: "/etc/spire-agent"
+    spire_data_dir: "/var/lib/spire-agent"
+    spire_runtime_dir: "/run/spire-agent"
+    spire_devid_dir: "{{ spire_config_dir }}/devid"
+
+    spire_agent_binary: "{{ spire_bin_dir }}/spire-agent"
+    spire_tpm_plugin: "{{ spire_plugin_dir }}/tpm_attestor_agent"
+    spire_tpm_pubhash_tool: "{{ spire_plugin_dir }}/get_tpm_pubhash"
+    spire_agent_socket: "{{ spire_runtime_dir }}/api.sock"
+
+    # Explicit reset for experiments. Normally false; the playbook also
+    # resets automatically if the attestor mode or bootstrap bundle changes.
+    spire_reset_state: false
+
+    # Force generation of a new TPM-resident LDevID and certificate.
+    # This also forces an agent-state reset.
+    spire_reprovision_devid: false
+
+    # LDevID identity used in the CSR and Smallstep token.
+    spire_devid_name: "{{ inventory_hostname }}"
+    spire_devid_subject: "/O=SPIRE RPI TPM Demo/CN={{ spire_devid_name }}"
+    spire_devid_san: "DNS:{{ spire_devid_name }}"
+
+    # Paths on the Ansible controller, relative to server-host/ansible/.
+    local_project_root: "{{ playbook_dir }}/.."
+    local_bin_dir: "{{ local_project_root }}/bin"
+    local_bootstrap_bundle: "{{ local_project_root }}/bootstrap.crt"
+    local_tpm_hash_dir: "{{ local_project_root }}/tpm-hashes"
+
+    # tpm_devid / Smallstep material.
+    local_device_ca_dir: "{{ local_project_root }}/device-ca"
+    local_device_ca_root: "{{ local_device_ca_dir }}/certs/root_ca.crt"
+    local_device_ca_intermediate: "{{ local_device_ca_dir }}/certs/intermediate_ca.crt"
+    local_endorsement_bundle: "{{ local_project_root }}/conf/tpm/endorsement-ca.pem"
+    local_enrollment_dir: "{{ local_device_ca_dir }}/enrollment/{{ inventory_hostname }}"
+
+    # Docker Compose service that runs step-ca.
+    step_ca_service: "step-ca"
+    step_ca_provisioner: "device-enroller"
+    step_ca_provisioner_password_file: "/home/step/secrets/password"
+
+  pre_tasks:
+    - name: Validate attestor selection
+      ansible.builtin.assert:
+        that:
+          - spire_attestor in ["tpm", "tpm_devid"]
+        fail_msg: "spire_attestor must be either 'tpm' or 'tpm_devid'"
+
+    - name: Require SPIRE server address
+      ansible.builtin.assert:
+        that:
+          - spire_server_address is defined
+          - spire_server_address | length > 0
+        fail_msg: >
+          Pass the SPIRE server host IP using
+          -e spire_server_address=<IP>
+
+    - name: Check TPM resource-manager device
+      ansible.builtin.stat:
+        path: /dev/tpmrm0
+      register: tpm_device
+
+    - name: Require TPM resource-manager device
+      ansible.builtin.assert:
+        that:
+          - tpm_device.stat.exists
+          - tpm_device.stat.ischr
+        fail_msg: >
+          /dev/tpmrm0 does not exist or is not a character device.
+          Enable/detect the TPM before deploying SPIRE.
+
+    - name: Require TPM access group
+      ansible.builtin.getent:
+        database: group
+        key: tss
+
+    - name: Check common controller-side files
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ local_bin_dir }}/spire-agent"
+        - "{{ local_bootstrap_bundle }}"
+      register: common_local_files
+      delegate_to: localhost
+      become: false
+
+    - name: Require common controller-side files
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+        fail_msg: "Required local file is missing: {{ item.item }}"
+      loop: "{{ common_local_files.results }}"
+      delegate_to: localhost
+      become: false
+
+    - name: Check external TPM plugin files
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ local_bin_dir }}/tpm_attestor_agent"
+        - "{{ local_bin_dir }}/get_tpm_pubhash"
+      register: tpm_local_files
+      when: spire_attestor == "tpm"
+      delegate_to: localhost
+      become: false
+
+    - name: Require external TPM plugin files
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+        fail_msg: "Required local TPM plugin file is missing: {{ item.item }}"
+      loop: "{{ tpm_local_files.results | default([]) }}"
+      when: spire_attestor == "tpm"
+      delegate_to: localhost
+      become: false
+
+    - name: Check tpm_devid controller-side trust material
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ local_device_ca_root }}"
+        - "{{ local_device_ca_intermediate }}"
+        - "{{ local_endorsement_bundle }}"
+      register: devid_local_files
+      when: spire_attestor == "tpm_devid"
+      delegate_to: localhost
+      become: false
+
+    - name: Require tpm_devid controller-side trust material
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+        fail_msg: "Required local tpm_devid file is missing: {{ item.item }}"
+      loop: "{{ devid_local_files.results | default([]) }}"
+      when: spire_attestor == "tpm_devid"
+      delegate_to: localhost
+      become: false
+
+  tasks:
+    - name: Install common SPIRE agent components
+      ansible.builtin.include_tasks: tasks/common.yml
+
+    - name: Provision external TPM attestor
+      ansible.builtin.include_tasks: tasks/tpm.yml
+      when: spire_attestor == "tpm"
+
+    - name: Provision built-in TPM DevID attestor
+      ansible.builtin.include_tasks: tasks/tpm_devid.yml
+      when: spire_attestor == "tpm_devid"
+
+    - name: Install validated SPIRE agent configuration
+      ansible.builtin.template:
+        src: templates/agent.conf.j2
+        dest: "{{ spire_config_dir }}/agent.conf"
+        owner: root
+        group: "{{ spire_agent_group }}"
+        mode: "0640"
+        validate: "{{ spire_agent_binary }} validate -config %s"
+      notify: Restart SPIRE agent
+
+    - name: Record deployed attestor mode
+      ansible.builtin.copy:
+        content: "{{ spire_attestor }}\n"
+        dest: "{{ spire_config_dir }}/.attestor-mode"
+        owner: root
+        group: "{{ spire_agent_group }}"
+        mode: "0640"
+
+    - name: Install validated SPIRE agent systemd unit
+      ansible.builtin.template:
+        src: templates/spire-agent.service.j2
+        dest: /etc/systemd/system/spire-agent.service
+        owner: root
+        group: root
+        mode: "0644"
+        validate: "/usr/bin/systemd-analyze verify %s:spire-agent.service"
+      notify:
+        - Reload systemd
+        - Restart SPIRE agent
+
+    - name: Flush handlers before starting agent
+      ansible.builtin.meta: flush_handlers
+
+    - name: Enable and start SPIRE agent
+      ansible.builtin.systemd_service:
+        name: spire-agent
+        enabled: true
+        state: started
+
+    - name: Wait for SPIRE Workload API socket
+      ansible.builtin.wait_for:
+        path: "{{ spire_agent_socket }}"
+        state: present
+        timeout: 45
+
+    - name: Check SPIRE agent service state
+      ansible.builtin.systemd_service:
+        name: spire-agent
+      register: spire_agent_service
+
+    - name: Verify SPIRE agent is running
+      ansible.builtin.assert:
+        that:
+          - spire_agent_service.status.ActiveState == "active"
+        fail_msg: >
+          SPIRE agent failed to remain active.
+          Check: journalctl -u spire-agent -n 100
+
+  handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+
+    - name: Restart SPIRE agent
+      ansible.builtin.systemd_service:
+        name: spire-agent
+        state: restarted
+        daemon_reload: true

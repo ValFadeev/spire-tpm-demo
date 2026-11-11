@@ -1,0 +1,31 @@
+[Unit]
+Description=SPIRE Agent
+Documentation=https://spiffe.io/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+User={{ spire_agent_user }}
+Group={{ spire_agent_group }}
+
+RuntimeDirectory=spire-agent
+RuntimeDirectoryMode=0750
+
+ExecStart={{ spire_agent_binary }} run -config {{ spire_config_dir }}/agent.conf
+
+Restart=on-failure
+RestartSec=5s
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+ProtectSystem=strict
+ProtectHome=true
+
+ReadWritePaths={{ spire_data_dir }}
+ReadWritePaths={{ spire_runtime_dir }}
+
+[Install]
+WantedBy=multi-user.target

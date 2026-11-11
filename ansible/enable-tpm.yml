@@ -1,0 +1,110 @@
+---
+- name: Enable TPM on Raspberry Pi
+  hosts: spire_agents
+  become: true
+
+  tasks:
+    - name: Check current Raspberry Pi OS boot config location
+      ansible.builtin.stat:
+        path: /boot/firmware/config.txt
+      register: firmware_config
+
+    - name: Check legacy Raspberry Pi OS boot config location
+      ansible.builtin.stat:
+        path: /boot/config.txt
+      register: legacy_config
+
+    - name: Select Raspberry Pi boot config
+      ansible.builtin.set_fact:
+        raspberry_pi_config: >-
+          {{
+            '/boot/firmware/config.txt'
+            if firmware_config.stat.exists
+            else
+            '/boot/config.txt'
+            if legacy_config.stat.exists
+            else
+            ''
+          }}
+
+    - name: Require Raspberry Pi boot config
+      ansible.builtin.assert:
+        that:
+          - raspberry_pi_config | length > 0
+        fail_msg: >
+          Could not find either /boot/firmware/config.txt or
+          /boot/config.txt. Is this Raspberry Pi OS?
+
+    - name: Install TPM userspace support
+      ansible.builtin.apt:
+        name:
+          - tpm-udev
+          - tpm2-tools
+        state: present
+        update_cache: true
+
+    - name: Create backup directory
+      ansible.builtin.file:
+        path: /var/backups/raspberry-pi
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Back up original Raspberry Pi boot config
+      ansible.builtin.copy:
+        src: "{{ raspberry_pi_config }}"
+        dest: /var/backups/raspberry-pi/config.txt.before-tpm
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0600"
+        force: false
+
+    - name: Enable SPI and LetsTrust TPM overlay
+      ansible.builtin.blockinfile:
+        path: "{{ raspberry_pi_config }}"
+        marker: "# {mark} ANSIBLE MANAGED TPM"
+        insertafter: EOF
+        backup: false
+        block: |
+          [all]
+          dtparam=spi=on
+          dtoverlay=tpm-slb9670
+      register: tpm_boot_config
+
+    - name: Reboot Raspberry Pi after boot configuration change
+      ansible.builtin.reboot:
+        msg: "Reboot initiated by Ansible after enabling TPM"
+        reboot_timeout: 180
+        connect_timeout: 10
+        post_reboot_delay: 5
+      when: tpm_boot_config.changed
+
+    - name: Check TPM character device
+      ansible.builtin.stat:
+        path: /dev/tpm0
+      register: tpm0
+
+    - name: Check TPM resource-manager device
+      ansible.builtin.stat:
+        path: /dev/tpmrm0
+      register: tpmrm0
+
+    - name: Verify TPM was detected after boot
+      ansible.builtin.assert:
+        that:
+          - tpm0.stat.exists
+          - tpm0.stat.ischr
+          - tpmrm0.stat.exists
+          - tpmrm0.stat.ischr
+        fail_msg: >
+          TPM configuration was applied, but /dev/tpm0 and/or
+          /dev/tpmrm0 was not created after reboot. Check:
+          dmesg | grep -i tpm
+
+    - name: Report successful TPM initialization
+      ansible.builtin.debug:
+        msg: >
+          TPM detected successfully:
+          /dev/tpm0 and /dev/tpmrm0 are present.

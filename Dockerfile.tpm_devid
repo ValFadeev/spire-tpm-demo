@@ -1,0 +1,20 @@
+FROM ubuntu:24.04
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p \
+    /opt/spire/bin \
+    /opt/spire/conf/server \
+    /opt/spire/data/server
+
+COPY bin/spire-server /opt/spire/bin/spire-server
+
+RUN chmod 0755 \
+    /opt/spire/bin/spire-server
+
+EXPOSE 8081
+
+ENTRYPOINT ["/opt/spire/bin/spire-server"]
+CMD ["run", "-config", "/opt/spire/conf/server/server.conf"]
